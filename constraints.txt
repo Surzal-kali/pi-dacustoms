@@ -28,6 +28,11 @@ aiohttp==3.14.3
 psutil==7.2.2
 ujson==6.0.0
 grpcio==1.78.0
+psycopg==3.2.12
+typing_extensions==4.15.0
 
 # --- 2. transitive ceilings ---
-typing-extensions==4.15.0
+# (empty right now — the old typing-extensions 4.15.0 ceiling lived here,
+# but the freeze mirrors the same pin verbatim; a ceiling that duplicates a
+# mirror pin is one more thing to bump on freeze day. Re-add ceilings here
+# ONLY for transitive pulls the freeze deliberately leaves open.)
