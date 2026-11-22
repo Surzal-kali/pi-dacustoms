@@ -328,6 +328,48 @@ def _flag(v):
     return bool(v)
 
 
+def _int(v, default):
+    """Integer that survives the bridge, with a floor instead of a crash.
+
+    OBSERVED LIVE 2026-11-22: max_samples arrived as "6" and the comparison
+    `len(samples) < max_samples` raised
+    "TypeError: '<' not supported between instances of 'int' and 'str'" - the
+    whole peek came back Failed. A tool must not crash on the shape its own
+    transport hands it.
+    """
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return default
+        return int(f)
+
+
+def _json_obj(v):
+    """dict, or a JSON string from the bridge, -> dict. (None -> {})
+
+    The WRITE path needs this most: a requestType sent with request_data as a
+    bare string would be answered by OBS with 4004 InvalidDataFieldType and a
+    half-understood mutation. Parse it here, or refuse loudly.
+    """
+    import json
+    if v is None or v == "":
+        return {}, True
+    if isinstance(v, dict):
+        return v, True
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+        except ValueError as exc:
+            return {}, False
+        if isinstance(parsed, dict):
+            return parsed, True
+        return {}, False
+    return {}, False
+
+
 def _strlist(v):
     """List, comma-string, or None -> list of stripped names (bridge-safe)."""
     if v is None or v == "":
@@ -558,8 +600,25 @@ async def _request(conn, request_type, request_data=None, timeout=8.0,
                 raise RuntimeError(f"{request_type} requestStatus.result=False, no code")
             out = d.get("responseData")
             if out is None:
-                out = d.get("data") if isinstance(d.get("data"), dict) else {}
-                notes.append("responseData absent, used d.data")
+                if isinstance(d.get("data"), dict):        # 4.x-style key
+                    out = d["data"]
+                    notes.append("responseData absent; used the 4.x-style d.data key")
+                else:
+                    # OBSERVED LIVE 2026-11-22 on a real SetCurrentProgramScene: the
+                    # reply carried requestStatus.code=100 and NO responseData key at
+                    # all, because this verb legitimately returns none. The old code
+                    # claimed "used d.data" when no such key existed - a note saying
+                    # something it isn't. Empty is a result here, not a shortfall.
+                    out = {}
+                    notes.append("no responseData key in the reply - this requestType "
+                                 "returns none per spec; success is requestStatus.code "
+                                 "100, so an empty result is not an error")
+            if code is not None or result is not None:
+                # Surface the status instead of making callers infer success from an
+                # empty payload - matters most for the write path.
+                out = dict(out)
+                out["_request_status"] = {"code": code, "result": result,
+                                          "comment": comment}
             if not isinstance(out, dict):
                 out = {"_value": out}
             if notes:
@@ -728,11 +787,11 @@ def obs_probe(rpc_version=1, capture=0):
     if problems:
         return _fail("config incomplete", config_problems=problems, config=cfg["url"])
 
-    tap = [] if int(capture or 0) > 0 else None
+    tap = [] if _int(capture, 0) > 0 else None
     async def _ladder():
         import json
         steps = {}
-        conn, identified, auth_state, wire = await _connect(cfg, int(rpc_version), (), tap)
+        conn, identified, auth_state, wire = await _connect(cfg, _int(rpc_version, 1), (), tap)
         steps["transport"] = "connected"
         steps["identified"] = True
         steps["server_says"] = {k: identified.get(k) for k in
@@ -755,7 +814,7 @@ def obs_probe(rpc_version=1, capture=0):
                                     "kind": _seq_kind(f["dir"], f["frame"])}
                                    for f in (tap or [])]
         if tap:
-            steps["raw_frames"] = tap[:int(capture)]
+            steps["raw_frames"] = tap[:_int(capture, 0)]
         return steps
 
     try:
@@ -775,13 +834,19 @@ def obs_enumerate(sources_limit=10, capture=0):
     # 5.x requestType names. The 4.x names this list used to carry
     # (GetStudioModeState, GetProfile, GetSpecialDirectories, GetTransitionList,
     # GetCurrentTransition) would each have come back 204 UnknownRequestType.
+    #
+    # DELIBERATELY ABSENT: GetStreamServiceSettings. It IS a read verb, but its
+    # response carries the stream service settings, and for rtmp_custom/rtmp_common
+    # those can include the STREAM KEY in cleartext - which would then sit in a tool
+    # result, a scratch entry and possibly a report. Never fold it into a routine
+    # enumeration; reading it is an explicit, individual decision.
     base = ["GetVersion", "GetSceneList", "GetStudioModeEnabled", "GetCurrentProgramScene",
             "GetCurrentPreviewScene", "GetGroupList", "GetInputList", "GetStats",
             "GetSceneCollectionList", "GetProfileList", "GetRecordStatus",
             "GetReplayBufferStatus", "GetVirtualCamStatus", "GetSceneTransitionList",
             "GetCurrentSceneTransition", "GetOutputList"]
 
-    _tap = [] if int(capture or 0) > 0 else None
+    _tap = [] if _int(capture, 0) > 0 else None
     async def _walk():
         import json
         conn, identified, auth_state, wire = await _connect(cfg, 1, (), _tap)
@@ -800,7 +865,7 @@ def obs_enumerate(sources_limit=10, capture=0):
                                                        op_key=wire["op_key_outbound"], tap=_tap)
                 except Exception as exc:
                     out["errors"][r] = _why(exc)
-            limit = max(0, int(sources_limit))
+            limit = max(0, _int(sources_limit, 10))
             scenes = (out["requests"].get("GetSceneList") or {}).get("scenes") or []
             out["scenes_seen"] = len(scenes)
             for sc in scenes[:limit]:
@@ -841,13 +906,15 @@ def obs_event_peek(seconds=5, categories=None, max_samples=25, types_only=False)
     bad = [c for c in cats if c not in CATEGORIES]
     if bad:
         return _fail("unknown event categories", unknown=bad, known=sorted(CATEGORIES))
-    secs = max(1, min(int(seconds), 120))
+    secs = max(1, min(_int(seconds, 5), 120))
+    cap = max(0, _int(max_samples, 25))
 
     async def _peek():
         import asyncio, json
         conn, identified, auth_state, wire = await _connect(cfg, 1, cats)
-        counts, others = {}, {}
+        counts, others, vcounts = {}, {}, {}
         ev_ops = set()   # opcode numbers this server uses for events - observed, not assumed
+        intents = set()  # eventIntent bits, observed - proves the bitfield on THIS server
         samples = []   # ordered, not mapped: order IS the timeline
         deadline = asyncio.get_running_loop().time() + secs
         try:
@@ -867,22 +934,55 @@ def obs_event_peek(seconds=5, categories=None, max_samples=25, types_only=False)
                 d = _d_of(frame)
                 ev_ops.add(_op_of(frame)[0])
                 ut = d.get("eventType") or d.get("updateType") or "?"  # 5.x says eventType
+                ed = d.get("eventData")
+                # WHAT `eventType` MEANS, because the bare name is ambiguous out of
+                # context. It is ALWAYS the OBS-side name of this op-5 frame - the
+                # obs-websocket protocol never carries a Twitch/YouTube event name
+                # here. OBS streaming to a service appears as StreamStateChanged
+                # (outputActive/outputState), which describes the OBS OUTPUT, not the
+                # platform. The one genuinely ambiguous case is VendorEvent: its
+                # eventData holds a THIRD-PARTY plugin's own eventType typedef, which
+                # is not an OBS event and may well come from a plugin that talks to
+                # Twitch or something else entirely. So name the source, and never
+                # blend a vendor typedef into OBS's event counts.
+                src = ("vendor" if ut == "VendorEvent" else
+                       "custom" if ut == "CustomEvent" else "obs")
                 counts[ut] = counts.get(ut, 0) + 1
-                if not _flag(types_only) and len(samples) < max_samples:
-                    samples.append({"at_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                                    "eventType": ut, "eventIntent": d.get("eventIntent"),
-                                    "eventData": d.get("eventData")})
+                if d.get("eventIntent") is not None:
+                    intents.add(d["eventIntent"])
+                if src == "vendor" and isinstance(ed, dict):
+                    vkey = "%s/%s" % (ed.get("vendorName") or "?", ed.get("eventType") or "?")
+                    vcounts[vkey] = vcounts.get(vkey, 0) + 1
+                if not _flag(types_only) and len(samples) < cap:
+                    sample = {"at_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                              "eventSource": src, "eventType": ut,
+                              "eventIntent": d.get("eventIntent"), "eventData": ed}
+                    if src == "vendor" and isinstance(ed, dict):
+                        # the plugin's own event name, kept apart from OBS's
+                        sample["vendorName"] = ed.get("vendorName")
+                        sample["vendorEventType"] = ed.get("eventType")
+                    samples.append(sample)
         finally:
             await conn.close()
         return {"requested_categories": cats, "requested_bits": sum(CATEGORIES[c] for c in cats),
                 "wire": {k: wire.get(k) for k in ("op_keys", "op_key_outbound", "identified_op",
                                                   "server_versions")},
                 "event_ops_observed": sorted(x for x in ev_ops if x is not None),
+                "event_intents_observed": sorted(i for i in intents if i is not None),
                 # 5.x Identified carries ONLY negotiatedRpcVersion, so a None here
                 # is the expected shape, not a gap in the tool.
                 "server_supported_event_subscriptions": identified.get("supportedEventSubscriptions"),
                 "event_subscriptions_sent": wire.get("event_subscriptions_sent"),
                 "auth": auth_state, "seconds": secs, "eventTypes": counts, "other_frames": others,
+                "vendorEventTypes": vcounts or None,
+                "event_semantics": ("eventTypes keys are OBS event names on op-5 frames "
+                                    "(obs-websocket side only). A Twitch/YouTube event name can "
+                                    "only ever appear under vendorEventTypes as 'vendorName/"
+                                    "eventType' from a plugin's VendorEvent payload, or inside "
+                                    "CustomEvent data broadcast by a client - never mixed into "
+                                    "eventTypes. OBS's stream to any service is reported as "
+                                    "StreamStateChanged / GetStreamStatus, which describes the "
+                                    "OBS output, not the platform."),
                 "samples": samples, "distinct_types": len(counts)}
 
     try:
@@ -921,10 +1021,17 @@ def obs_request(request_type, request_data=None, confirm=None):
         return _fail("confirmation mismatch",
                      detail="confirm must equal requestType verbatim; nothing was sent")
 
+    data_arg, parsed_ok = _json_obj(request_data)
+    if not parsed_ok:
+        return _fail("request_data is not a JSON object",
+                     detail="the bridge may hand it as a string - send it as a JSON object "
+                            "or a JSON-encoded object string; nothing was sent",
+                     requestType=request_type, sent=False)
+
     async def _do():
         conn, identified, auth_state, wire = await _connect(cfg, 1, ())
         try:
-            return await _request(conn, request_type, request_data or {}, timeout=cfg["timeout_s"],
+            return await _request(conn, request_type, data_arg, timeout=cfg["timeout_s"],
                                   op_key=wire["op_key_outbound"])
         finally:
             await conn.close()
